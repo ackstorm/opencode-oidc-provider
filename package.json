@@ -5,5 +5,12 @@
   "license": "Apache-2.0",
   "type": "module",
   "main": "index.mjs",
-  "files": ["index.mjs", "README.md", "LICENSE"]
+  "files": [
+    "index.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
 }
