@@ -35,7 +35,7 @@ const paths = () => ({
   skills: `${DATA}/${PROVIDER}/skills`,
 })
 const CONFIG_SCHEMA = "ackstorm.opencode-config/1"
-const CONFIG_KEYS = ["provider", "mcp", "instructions"] // anything else the server sends is ignored
+const CONFIG_KEYS = ["provider", "mcp", "instructions", "model", "small_model"] // anything else the server sends is ignored
 const CACHE_MAX_AGE = 30 * 86_400_000
 const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 const b64 = (b) => Buffer.from(b).toString("base64url")

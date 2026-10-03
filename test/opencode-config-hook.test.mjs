@@ -101,6 +101,12 @@ test("fillMissing: user wins, recursion, arrays kept, instructions appended, all
   })
 })
 
+test("fillMissing: model and small_model are defaults, the user's own choice wins", () => {
+  const body = { model: "acme/fast", small_model: "acme/lite" }
+  assert.deepEqual(fillMissing({}, body), body)
+  assert.deepEqual(fillMissing({ model: "mine/x" }, body), { model: "mine/x", small_model: "acme/lite" })
+})
+
 test("fillMissing: a hostile __proto__/constructor key cannot pollute Object.prototype", () => {
   const target = { provider: { anthropic: {} }, mcp: { "mcp-y": {} } }
   const malicious = JSON.parse('{"provider":{"__proto__":{"polluted":"yes"}},"mcp":{"constructor":{"polluted":"yes"}}}')

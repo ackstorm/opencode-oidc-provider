@@ -70,6 +70,10 @@ One file serves both: v1 loads `default.server` (`SsoAuth`, the `auth` +
 `refresh`, plus provider/MCP/skill transforms). v2 injects the credential by
 `integrationID` and refreshes it 5 minutes before expiry.
 
+The server's `model` / `small_model` (`<provider>/<name>`) are applied as defaults
+on **v1 only**; the user's own `model` / `small_model` win. v2 ignores them for now
+(its core has `model.transform` → `default.set`, but plugin access is unverified).
+
 ## Files it writes (`$XDG_DATA_HOME/opencode`, default `~/.local/share/opencode`)
 
 | File | Content |
