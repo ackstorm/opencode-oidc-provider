@@ -15,7 +15,9 @@ opencode auth login https://<origin>      # installs and configures the plugin
 opencode auth login -p <provider>         # sign in (v2: opencode auth login <provider>)
 ```
 
-Restart OpenCode to pick up backend changes.
+Restart OpenCode to pick up backend changes. Signing in always re-discovers
+the authorization server, so a moved one needs no restart (v2's background
+service included).
 
 Headless machine: pick the device-code method. On opencode v2 without a
 browser, put a stub `xdg-open` on `PATH` (`printf '#!/bin/sh\necho "$1"\n'`),

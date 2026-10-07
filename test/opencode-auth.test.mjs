@@ -94,6 +94,34 @@ test("a login registers once and a refresh reuses that identity", async () => {
   assert.equal(tokenCalls, before, "no token call was made with the rotated refresh token")
 })
 
+test("every login re-discovers: a moved authorization server is used without a restart", async () => {
+  // The 2026-10 bug: v2's background service outlived an AS move and kept
+  // registering clients at the old issuer. Fresh module: discovery is cached.
+  const { SsoAuth: Fresh } = await import("../index.mjs?relogin")
+  // Its own provider: the move rewrites client.json, which other tests share.
+  const plugin = await Fresh({ client: fakeClient().client }, { ...OPTIONS, provider: "acme-moved" })
+  const device = plugin.auth.methods[1]
+  assert.match((await device.authorize()).url, /^https:\/\/as\.test\//)
+  const MOVED = "https://moved.test"
+  const base = globalThis.fetch
+  globalThis.fetch = async (input, init) => {
+    const url = typeof input === "string" ? input : input.url
+    const ok = (body) => new Response(JSON.stringify(body), { status: 200 })
+    if (url.startsWith("https://api.test/.well-known/oauth-protected-resource")) return ok({ authorization_servers: [MOVED] })
+    if (url === `${MOVED}/.well-known/oauth-authorization-server`) {
+      return ok({ issuer: MOVED, token_endpoint: `${MOVED}/token`, registration_endpoint: `${MOVED}/register`, authorization_endpoint: `${MOVED}/authorize`, device_authorization_endpoint: `${MOVED}/device_authorization` })
+    }
+    if (url === `${MOVED}/register`) return ok({ client_id: "c2" })
+    if (url === `${MOVED}/device_authorization`) return ok({ device_code: "dc-2", user_code: "MOVE-DTWO", verification_uri: `${MOVED}/device`, expires_in: 600, interval: 0.01 })
+    return base(input, init)
+  }
+  try {
+    assert.match((await device.authorize()).url, /^https:\/\/moved\.test\//)
+  } finally {
+    globalThis.fetch = base
+  }
+})
+
 test("a failed discovery is retried on the next call", async () => {
   // Discovery is cached per module instance; take a fresh one.
   const { SsoAuth: Fresh } = await import("../index.mjs?fresh")
@@ -118,7 +146,7 @@ async function fetchRaw(redirect, query) {
 
 test("the device method opens the verification URL and polls until the user has signed in", async () => {
   const f = fakeClient()
-  const plugin = await SsoAuth({ client: f.client })
+  const plugin = await SsoAuth({ client: f.client }, OPTIONS)
   const method = plugin.auth.methods[1]
   assert.match(method.label, /device code/)
   const { url, instructions, callback } = await method.authorize()

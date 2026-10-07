@@ -67,9 +67,12 @@ async function apiUrl(client, options) {
 }
 
 // API URL -> protected-resource document (RFC 9728) -> authorization-server
-// metadata (RFC 8414). Once per process.
+// metadata (RFC 8414). Cached per process for refreshes; a login passes
+// fresh=true, because a long-lived process (v2's background service) would
+// otherwise keep a moved authorization server until it restarts.
 let discovered
-function discover(client, options) {
+function discover(client, options, fresh = false) {
+  if (fresh) discovered = undefined
   return (discovered ??= (async () => {
     const api = await apiUrl(client, options)
     if (!api) throw new Error(`no backend for ${PROVIDER}: run \`opencode auth login https://<origin>\` to install it with its options`)
@@ -337,7 +340,7 @@ export async function SsoAuth({ client }, options = {}) {
           type: "oauth",
           label: "SSO (browser)",
           async authorize() {
-            const d = await discover(client, options)
+            const d = await discover(client, options, true)
             const verifier = b64(randomBytes(32))
             const state = b64(randomBytes(16))
             const client_id = await clientId(d) // before the listener: a failure here must not leave a port waiting
@@ -372,7 +375,7 @@ export async function SsoAuth({ client }, options = {}) {
           type: "oauth",
           label: "SSO (device code — sign in from another browser)",
           async authorize() {
-            const d = await discover(client, options)
+            const d = await discover(client, options, true)
             if (!d.as.device_authorization_endpoint) throw new Error("the authorization server does not offer the device grant")
             const client_id = await clientId(d)
             const da = await json(d.as.device_authorization_endpoint, {
@@ -471,7 +474,7 @@ async function refreshCredential(methodID, credential, options) {
 }
 
 async function authorizeBrowser(options) {
-  const d = await discover(undefined, options)
+  const d = await discover(undefined, options, true)
   const verifier = b64(randomBytes(32))
   const state = b64(randomBytes(16))
   const client_id = await clientId(d)
@@ -499,7 +502,7 @@ async function authorizeBrowser(options) {
 }
 
 async function authorizeDevice(options) {
-  const d = await discover(undefined, options)
+  const d = await discover(undefined, options, true)
   if (!d.as.device_authorization_endpoint) throw new Error("the authorization server does not offer the device grant")
   const client_id = await clientId(d)
   const da = await json(d.as.device_authorization_endpoint, {
