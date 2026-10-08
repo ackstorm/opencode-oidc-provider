@@ -520,63 +520,95 @@ async function authorizeDevice(options) {
   }
 }
 
-// Fetches /clients/opencode/config with the resolved credential and
-// registers provider+models, mcp servers and skills through the typed
-// transforms. Mirrors applyConfig()'s failure handling: any error here must
-// never stop opencode starting.
-async function applyV2Config(ctx) {
-  const active = await ctx.integration.connection.active(PROVIDER).catch(() => undefined)
-  if (!active) return // signed out: nothing to deliver, same as v1
-  const credential = await ctx.integration.connection.resolve(active).catch(() => undefined)
-  if (credential?.type !== "oauth") return
-  const { platform } = await backend(ctx.options)
-  const body = await fetchConfig(platform, credential.access)
-  if (!body || body.auth === "invalid") return
-  const cfg = body.config ?? {}
+// Last good /clients/opencode/config body for the active credential, or null.
+// The transforms below read it; a login or logout in the running service
+// (credential.switched) replaces it and reloads them, so no restart is needed.
+let delivered = null
 
+// Fetches /clients/opencode/config with the resolved credential. Mirrors
+// applyConfig()'s failure handling: never throws, null means "nothing to deliver".
+async function loadV2Config(ctx) {
+  try {
+    const active = await ctx.integration.connection.active(PROVIDER).catch(() => undefined)
+    if (!active) return null // signed out: nothing to deliver, same as v1
+    const credential = await ctx.integration.connection.resolve(active).catch(() => undefined)
+    if (credential?.type !== "oauth") return null
+    const { platform } = await backend(ctx.options)
+    const body = await fetchConfig(platform, credential.access)
+    if (!body || body.auth === "invalid") return null
+    await writeSkills(body.skills)
+    return body
+  } catch {
+    return null
+  }
+}
+
+// Registers provider+models, mcp servers and skills through the typed
+// transforms, once; each run reads `delivered`.
+async function registerV2Transforms(ctx) {
   await ctx.provider.transform((editor) => {
-    for (const [pid, p] of Object.entries(cfg.provider ?? {})) {
-      const models = Object.entries(p?.models ?? {}).map(([mid, m]) => toModelInfo(pid, mid, m))
-      if (!models.length) continue
-      editor.add({
-        info: {
-          id: pid,
-          name: p?.name ?? pid,
-          activation: "enabled",
-          // v1's wire schema carries `npm` for the v1 loader (raw @ai-sdk/openai-compatible,
-          // which that loader consumes directly). v2's DynamicProviderPlugin expects a
-          // `.model(modelID, settings)` factory that the vanilla published package does not
-          // have at any version (opencode's own monorepo patches it in); their own built-in
-          // openai-compatible-style providers (e.g. LM Studio) use this wrapper instead
-          // (packages/core/src/plugin/provider/lmstudio.ts, verified against opencode 2.0.18).
-          // This is v2-runtime plumbing, not server config, so it's hardcoded here rather than
-          // trusting `p.npm` — verified end-to-end against a real device-grant login.
-          package: "@opencode/ai/providers/openai-compatible",
-          integrationID: PROVIDER,
-          settings: p?.options?.baseURL ? { baseURL: p.options.baseURL } : undefined,
-        },
-        models,
-      })
+    for (const [pid, p] of Object.entries(delivered?.config?.provider ?? {})) {
+      // A throwing transform disables the whole plugin, login included: skip the entry instead.
+      try {
+        const models = Object.entries(p?.models ?? {}).map(([mid, m]) => toModelInfo(pid, mid, m))
+        if (!models.length) continue
+        editor.add({
+          info: {
+            id: pid,
+            name: p?.name ?? pid,
+            activation: "enabled",
+            // v1's wire schema carries `npm` for the v1 loader (raw @ai-sdk/openai-compatible,
+            // which that loader consumes directly). v2's DynamicProviderPlugin expects a
+            // `.model(modelID, settings)` factory that the vanilla published package does not
+            // have at any version (opencode's own monorepo patches it in); their own built-in
+            // openai-compatible-style providers (e.g. LM Studio) use this wrapper instead
+            // (packages/core/src/plugin/provider/lmstudio.ts, verified against opencode 2.0.18).
+            // This is v2-runtime plumbing, not server config, so it's hardcoded here rather than
+            // trusting `p.npm` — verified end-to-end against a real device-grant login.
+            package: "@opencode/ai/providers/openai-compatible",
+            integrationID: PROVIDER,
+            settings: p?.options?.baseURL ? { baseURL: p.options.baseURL } : undefined,
+          },
+          models,
+        })
+      } catch {}
     }
   })
 
   await ctx.mcp.transform((editor) => {
-    for (const [name, m] of Object.entries(cfg.mcp ?? {})) {
+    for (const [name, m] of Object.entries(delivered?.config?.mcp ?? {})) {
       if (m?.type !== "remote" || !m.url) continue
-      editor.set(name, { type: "remote", url: m.url, disabled: m.enabled === false })
+      try {
+        editor.set(name, { type: "remote", url: m.url, disabled: m.enabled === false })
+      } catch {}
     }
   })
 
-  if (await writeSkills(body.skills)) {
+  await ctx.skill.transform((editor) => {
     const dir = paths().skills
-    await ctx.skill.transform((editor) => {
-      for (const s of Array.isArray(body.skills) ? body.skills : []) {
-        const md = s?.files?.["SKILL.md"]
-        if (typeof md !== "string") continue
+    for (const s of Array.isArray(delivered?.skills) ? delivered.skills : []) {
+      const md = s?.files?.["SKILL.md"]
+      if (typeof s?.name !== "string" || !SKILL_NAME.test(s.name) || typeof md !== "string") continue
+      try {
         editor.add({ id: s.name, name: s.name, path: `${dir}/${s.name}/SKILL.md`, content: md })
-      }
-    })
-  }
+      } catch {}
+    }
+  })
+}
+
+// v2's background service outlives `opencode auth login`: the credential lands
+// in this process (credential.switched, core/src/credential.ts), so re-fetch
+// and reload instead of waiting for a restart. Never awaited; runs until unload.
+async function watchLogin(ctx) {
+  try {
+    for await (const e of ctx.event.subscribe()) {
+      if (e?.type !== "credential.switched" || e.data?.integrationID !== PROVIDER) continue
+      try {
+        delivered = await loadV2Config(ctx)
+        await Promise.all([ctx.provider.reload(), ctx.mcp.reload(), ctx.skill.reload()])
+      } catch {} // one failed reload must not end the watch: the next login retries
+    }
+  } catch {} // ponytail: silent; worst case is the old behaviour (restart to pick up a login)
 }
 
 // One file, both engines: opencode v1 reads `server` (it rejects a default export
@@ -606,8 +638,10 @@ export default {
       })
     })
 
+    delivered = await loadV2Config(ctx)
     try {
-      await applyV2Config(ctx)
+      await registerV2Transforms(ctx)
     } catch {} // ponytail: silent; a broken backend must never stop opencode starting
+    watchLogin(ctx)
   },
 }

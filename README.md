@@ -16,8 +16,9 @@ opencode auth login -p <provider>         # sign in (v2: opencode auth login <pr
 ```
 
 Restart OpenCode to pick up backend changes. Signing in always re-discovers
-the authorization server, so a moved one needs no restart (v2's background
-service included).
+the authorization server, so a moved one needs no restart. On v2, signing in or
+out also reloads models, MCP servers and skills in the running background
+service: no `opencode service restart` needed.
 
 Headless machine: pick the device-code method. On opencode v2 without a
 browser, put a stub `xdg-open` on `PATH` (`printf '#!/bin/sh\necho "$1"\n'`),
