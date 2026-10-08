@@ -434,6 +434,8 @@ const modality = (list) => (Array.isArray(list) && list.length ? list : ["text"]
 // v2 has no attachment/reasoning/temperature fields (opencode normalizer logs
 // them as "unsupported legacy setting" and drops them); capability now lives
 // in capabilities.input/output, and cost is an array of tiers, not an object.
+// `reasoning` becomes the low/medium/high variants v1 generated itself — the
+// same ones v2's Variant.resolve gives openai-compatible (core/src/variant.ts:76-79).
 function toModelInfo(providerID, id, m) {
   return {
     id,
@@ -445,7 +447,7 @@ function toModelInfo(providerID, id, m) {
       input: modality(m?.modalities?.input),
       output: modality(m?.modalities?.output),
     },
-    variants: [],
+    variants: m?.reasoning ? ["low", "medium", "high"].map((id) => ({ id, settings: { reasoningEffort: id } })) : [],
     time: { released: 0 },
     cost: [
       {

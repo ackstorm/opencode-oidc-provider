@@ -15,7 +15,7 @@ globalThis.fetch = async (input) => {
   return Response.json({
     schema: "ackstorm.opencode-config/1",
     auth: "ok",
-    config: { provider: { acme: { name: "Acme", models: { "acme.smart": {} } } } },
+    config: { provider: { acme: { name: "Acme", models: { "acme.smart": {}, "acme.think": { reasoning: true } } } } },
     skills: [],
   })
 }
@@ -78,7 +78,16 @@ test("v2: login and logout in the running service reload the provider", async ()
   f.login({ type: "credential", id: "cred_1" })
   await settle()
   assert.deepEqual(f.providers.value.map((p) => p.info.id), ["acme"])
-  assert.deepEqual(f.providers.value[0].models.map((m) => m.id), ["acme.smart"])
+  assert.deepEqual(f.providers.value[0].models.map((m) => m.id), ["acme.smart", "acme.think"])
+
+  // reasoning: true -> the effort variants v1 generated; anything else -> none
+  const [smart, think] = f.providers.value[0].models
+  assert.deepEqual(smart.variants, [])
+  assert.deepEqual(think.variants, [
+    { id: "low", settings: { reasoningEffort: "low" } },
+    { id: "medium", settings: { reasoningEffort: "medium" } },
+    { id: "high", settings: { reasoningEffort: "high" } },
+  ])
 
   f.login(undefined)
   await settle()
