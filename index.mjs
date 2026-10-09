@@ -545,6 +545,15 @@ async function loadV2Config(ctx) {
   }
 }
 
+// v2 takes a skill as given and never reads its frontmatter: one without a
+// description is left out of the model's skill list and shown blank in /skills.
+// ponytail: single-line `description:` only (what our backends send); a YAML
+// parser if one ever sends a folded/multi-line value.
+function skillDescription(md) {
+  const front = md.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1] ?? ""
+  return front.match(/^description:[ \t]*(.+?)[ \t]*$/m)?.[1].replace(/^(["'])(.*)\1$/, "$2")
+}
+
 // Registers provider+models, mcp servers and skills through the typed
 // transforms, once; each run reads `delivered`.
 async function registerV2Transforms(ctx) {
@@ -592,7 +601,7 @@ async function registerV2Transforms(ctx) {
       const md = s?.files?.["SKILL.md"]
       if (typeof s?.name !== "string" || !SKILL_NAME.test(s.name) || typeof md !== "string") continue
       try {
-        editor.add({ id: s.name, name: s.name, path: `${dir}/${s.name}/SKILL.md`, content: md })
+        editor.add({ id: s.name, name: s.name, description: skillDescription(md), path: `${dir}/${s.name}/SKILL.md`, content: md })
       } catch {}
     }
   })

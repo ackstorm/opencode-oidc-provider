@@ -16,7 +16,7 @@ globalThis.fetch = async (input) => {
     schema: "ackstorm.opencode-config/1",
     auth: "ok",
     config: { provider: { acme: { name: "Acme", models: { "acme.smart": {}, "acme.think": { reasoning: true } } } } },
-    skills: [],
+    skills: [{ name: "acme-api", version: "sha256:a", files: { "SKILL.md": "---\nname: acme-api\ndescription: Use when the user mentions Acme.\n---\nbody" } }],
   })
 }
 
@@ -35,9 +35,12 @@ function fakeCtx() {
   }
   const providers = state(() => [])
   providers.editor = (list) => ({ add: (p) => list.push(p) })
+  const skills = state(() => [])
+  skills.editor = (list) => ({ add: (s) => list.push(s) })
   const noop = () => ({ editor: () => ({ set() {}, add() {} }), transform: async () => {}, reload: async () => {} })
   return {
     providers,
+    skills,
     login(c) {
       connection = c
       events.push({ type: "credential.switched", data: { integrationID: "acme", credentialID: c ? "cred_1" : null } })
@@ -54,7 +57,7 @@ function fakeCtx() {
       },
       provider: providers,
       mcp: noop(),
-      skill: noop(),
+      skill: skills,
       event: {
         async *subscribe() {
           for (;;) {
@@ -88,6 +91,10 @@ test("v2: login and logout in the running service reload the provider", async ()
     { id: "medium", settings: { reasoningEffort: "medium" } },
     { id: "high", settings: { reasoningEffort: "high" } },
   ])
+
+  // v2 never reads the frontmatter: without the description the skill is hidden from the model
+  await f.skills.reload()
+  assert.deepEqual(f.skills.value.map((s) => [s.id, s.description]), [["acme-api", "Use when the user mentions Acme."]])
 
   f.login(undefined)
   await settle()
