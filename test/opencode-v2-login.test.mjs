@@ -100,3 +100,35 @@ test("v2: login and logout in the running service reload the provider", async ()
   await settle()
   assert.deepEqual(f.providers.value, [])
 })
+
+test("v2: a dead refresh token keeps the cached provider and names the re-login", async () => {
+  const f = fakeCtx()
+  await plugin.setup(f.ctx)
+  f.login({ type: "credential", id: "cred_1" }) // fills the cache, like the test above
+  await settle()
+
+  // what core does when our refresh() throws: AuthorizationError wraps it
+  f.ctx.integration.connection.resolve = async () => { throw new Error("Integration.Authorization") }
+  f.login({ type: "credential", id: "cred_1" })
+  await settle()
+  assert.deepEqual(f.providers.value.map((p) => p.info.id), ["acme"])
+
+  const realFetch = globalThis.fetch
+  globalThis.fetch = async (input) => {
+    const url = typeof input === "string" ? input : input.url
+    if (url.endsWith("/.well-known/oauth-protected-resource/v1")) return Response.json({ authorization_servers: ["https://api.test"] })
+    if (url.endsWith("/.well-known/oauth-authorization-server")) return Response.json({ issuer: "https://api.test", token_endpoint: "https://api.test/token" })
+    if (url === "https://api.test/token") return Response.json({ error: "invalid_grant" }, { status: 400 })
+    throw new Error(`unexpected ${url}`)
+  }
+  try {
+    const { writeFile } = await import("node:fs/promises")
+    await writeFile(`${process.env.XDG_DATA_HOME}/opencode/acme/client.json`, JSON.stringify({ issuer: "https://api.test", client_id: "c" }))
+    let refresh
+    f.ctx.integration.transform = async (fn) => fn({ update() {}, method: { update: (m) => { refresh ??= m.refresh } } })
+    await plugin.setup(f.ctx)
+    await assert.rejects(refresh({ refresh: "dead" }), /opencode auth login acme/)
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})

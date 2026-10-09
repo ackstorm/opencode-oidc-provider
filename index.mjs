@@ -148,7 +148,9 @@ async function fresh(cur, { client, options, getAuth }) {
       // Only the token endpoint's 4xx means "signed out"; a 4xx from discovery
       // (a misrouted .well-known) is an outage, not a revoked session.
       ...(await token(d, { grant_type: "refresh_token", refresh_token: again.refresh, client_id }).catch((e) => {
-        throw Object.assign(e, { signedOut: e.status >= 400 && e.status < 500 })
+        console.warn(`[${PROVIDER}] token refresh failed: ${e.message}`)
+        if (e.status >= 400 && e.status < 500) throw new Error(`${PROVIDER} session expired, run \`opencode auth login ${PROVIDER}\``)
+        throw e
       })),
     }
     t.refresh ||= again.refresh
@@ -239,20 +241,17 @@ async function fetchConfig(platform, access) {
   }
 }
 
-// The config hook. Signed out → nothing (not even the cache). Backend down →
-// the same user's cache if < 30 d. Never throws; errors mean "no backend config".
+// The config hook. Signed out → nothing (not even the cache). Backend down or
+// refresh token rejected → the same user's cache if < 30 d, so the provider
+// stays listed and a chat shows fresh()'s "run opencode auth login". Never
+// throws; errors mean "no backend config".
 async function applyConfig(cfg, { client, options }) {
   const getAuth = async () => (await readJson(AUTH_FILE))?.[PROVIDER]
   const stored = await getAuth()
   if (stored?.type !== "oauth") return
   const forget = () => rm(paths().cache, { force: true })
-  let auth = null
-  try {
-    auth = await fresh(stored, { client, options, getAuth })
-  } catch (e) {
-    if (e.signedOut) return forget() // refresh token rejected
-    // AS unreachable: an expired access token would read as "invalid", so use the cache.
-  }
+  // An expired access token would read as "invalid" at the backend, so a failed refresh uses the cache.
+  const auth = await fresh(stored, { client, options, getAuth }).catch(() => null)
   let body = auth ? await fetchConfig((await backend(options)).platform, auth.access) : null
   if (body?.auth === "invalid") return forget()
   if (body) {
@@ -470,7 +469,10 @@ async function refreshCredential(methodID, credential, options) {
   const client_id = await savedClientId(d.issuer)
   if (!client_id) throw new Error(`SSO client identity lost, run \`opencode auth login -p ${PROVIDER}\``)
   const t = await token(d, { grant_type: "refresh_token", refresh_token: credential.refresh, client_id }).catch((e) => {
-    throw Object.assign(e, { signedOut: e.status >= 400 && e.status < 500 })
+    console.warn(`[${PROVIDER}] token refresh failed: ${e.message}`)
+    // Only the token endpoint's 4xx (invalid_grant) means the session is over; 5xx is retried.
+    if (e.status >= 400 && e.status < 500) throw new Error(`${PROVIDER} session expired, run \`opencode auth login ${PROVIDER}\``)
+    throw e
   })
   return { type: "oauth", methodID, refresh: t.refresh || credential.refresh, access: t.access, expires: t.expires }
 }
@@ -529,17 +531,27 @@ let delivered = null
 
 // Fetches /clients/opencode/config with the resolved credential. Mirrors
 // applyConfig()'s failure handling: never throws, null means "nothing to deliver".
+// A credential that no longer resolves (dead refresh token) or a backend that
+// is down falls back to the last cached body (< 30 d), so the provider stays
+// listed and a chat shows refreshCredential()'s "run opencode auth login".
 async function loadV2Config(ctx) {
   try {
     const active = await ctx.integration.connection.active(PROVIDER).catch(() => undefined)
     if (!active) return null // signed out: nothing to deliver, same as v1
-    const credential = await ctx.integration.connection.resolve(active).catch(() => undefined)
-    if (credential?.type !== "oauth") return null
+    const credential = await ctx.integration.connection.resolve(active).catch((e) => {
+      console.warn(`[${PROVIDER}] credential did not resolve: ${e?.message ?? e}`)
+    })
     const { platform } = await backend(ctx.options)
-    const body = await fetchConfig(platform, credential.access)
-    if (!body || body.auth === "invalid") return null
-    await writeSkills(body.skills)
-    return body
+    const body = credential?.type === "oauth" ? await fetchConfig(platform, credential.access) : null
+    if (body?.auth === "invalid") return null
+    if (body) {
+      await writePrivate(paths().cache, JSON.stringify({ user: body.user, fetchedAt: Date.now(), body }))
+      await writeSkills(body.skills)
+      return body
+    }
+    console.warn(`[${PROVIDER}] no config from ${platform}, using the cached one`)
+    const cache = await readJson(paths().cache)
+    return cache && Date.now() - cache.fetchedAt <= CACHE_MAX_AGE ? cache.body : null
   } catch {
     return null
   }

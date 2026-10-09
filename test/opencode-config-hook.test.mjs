@@ -207,15 +207,17 @@ test("an expiring token is refreshed once and saved through opencode", async () 
   assert.equal(saved[0].refresh, "r2")
 })
 
-test("a rejected refresh means signed out: cache cleared, no fetch", async () => {
+test("a rejected refresh keeps the provider from the cache and names the re-login", async () => {
   signIn("alice@example.com", 0)
   writeFileSync(CACHE, JSON.stringify({ user: "alice@example.com", fetchedAt: Date.now(), body: BODY() }))
   server.token = () => Response.json({ error: "invalid_grant" }, { status: 400 })
+  const plugin = await SsoAuth({ client: { auth: { set: async () => {} } } }, OPTIONS)
   const cfg = {}
-  await (await hook())(cfg)
-  assert.deepEqual(cfg, {})
+  await plugin.config(cfg)
+  assert.ok(cfg.provider) // still listed: a chat says why it fails instead of the provider vanishing
   assert.equal(configCalls, 0)
-  assert.equal(existsSync(CACHE), false)
+  const loader = await plugin.auth.loader(async () => JSON.parse(readFileSync(`${DATA}/auth.json`, "utf8")).acme)
+  await assert.rejects(loader.fetch("https://model.test/x"), /opencode auth login acme/)
 })
 
 test("the hook never throws", async () => {
