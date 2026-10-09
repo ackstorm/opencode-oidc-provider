@@ -132,3 +132,51 @@ test("v2: a dead refresh token keeps the cached provider and names the re-login"
     globalThis.fetch = realFetch
   }
 })
+
+// The service runs setup() once per location (each directory a TUI opens) in one
+// module instance, and reloads providers every 5 min: a signed-out or failed load
+// in one location must not drop the provider in another.
+test("v2: each location keeps its own config", async () => {
+  const a = fakeCtx()
+  await plugin.setup(a.ctx)
+  a.login({ type: "credential", id: "cred_1" })
+  await settle()
+  assert.deepEqual(a.providers.value.map((p) => p.info.id), ["acme"])
+
+  await plugin.setup(fakeCtx().ctx) // second location, nothing to deliver
+  await a.providers.reload()
+  assert.deepEqual(a.providers.value.map((p) => p.info.id), ["acme"])
+})
+
+// Every location resolves the shared credential at once after a login or a
+// restart; the AS rotates refresh tokens, so a second refresh with the same
+// token gets invalid_grant. One exchange, one result for all.
+test("v2: concurrent refreshes spend the refresh token once", async () => {
+  const realFetch = globalThis.fetch
+  let spent = 0
+  globalThis.fetch = async (input, init) => {
+    const url = typeof input === "string" ? input : input.url
+    if (url.endsWith("/.well-known/oauth-protected-resource/v1")) return Response.json({ authorization_servers: ["https://api.test"] })
+    if (url.endsWith("/.well-known/oauth-authorization-server")) return Response.json({ issuer: "https://api.test", token_endpoint: "https://api.test/token" })
+    if (url === "https://api.test/token") {
+      await settle()
+      if (new URLSearchParams(String(init.body)).get("refresh_token") !== "r1" || spent++) return Response.json({ error: "invalid_grant" }, { status: 400 })
+      return Response.json({ access_token: "a2", refresh_token: "r2", expires_in: 3600 })
+    }
+    throw new Error(`unexpected ${url}`)
+  }
+  try {
+    const { writeFile, mkdir } = await import("node:fs/promises")
+    await mkdir(`${process.env.XDG_DATA_HOME}/opencode/acme`, { recursive: true })
+    await writeFile(`${process.env.XDG_DATA_HOME}/opencode/acme/client.json`, JSON.stringify({ issuer: "https://api.test", client_id: "c" }))
+    const f = fakeCtx()
+    let refresh
+    f.ctx.integration.transform = async (fn) => fn({ update() {}, method: { update: (m) => { refresh ??= m.refresh } } })
+    await plugin.setup(f.ctx)
+    const results = await Promise.all([1, 2, 3].map(() => refresh({ refresh: "r1" })))
+    assert.deepEqual(results.map((r) => r.refresh), ["r2", "r2", "r2"])
+    assert.equal(spent, 1)
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})

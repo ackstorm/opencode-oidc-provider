@@ -1,6 +1,6 @@
 {
   "name": "opencode-oidc-provider",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "description": "OpenCode plugin (v1 and v2): OAuth/OIDC sign-in to a model gateway, plus per-user models, MCP servers and skills from its backend",
   "license": "Apache-2.0",
   "type": "module",

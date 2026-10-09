@@ -464,7 +464,16 @@ function toModelInfo(providerID, id, m) {
 // Shared by both oauth methods: same refresh-token exchange as v1's fresh(),
 // but returns the shape opencode's own resolver expects and does not persist
 // anything itself (opencode does that after the callback/refresh resolves).
-async function refreshCredential(methodID, credential, options) {
+// Every location resolves the credential at once (login, restart) and the AS
+// rotates refresh tokens, so callers holding the same token share one exchange.
+const refreshes = new Map()
+function refreshCredential(methodID, credential, options) {
+  const key = credential.refresh
+  if (!refreshes.has(key)) refreshes.set(key, exchange(methodID, credential, options).finally(() => refreshes.delete(key)))
+  return refreshes.get(key)
+}
+
+async function exchange(methodID, credential, options) {
   const d = await discover(undefined, options)
   const client_id = await savedClientId(d.issuer)
   if (!client_id) throw new Error(`SSO client identity lost, run \`opencode auth login -p ${PROVIDER}\``)
@@ -524,11 +533,6 @@ async function authorizeDevice(options) {
   }
 }
 
-// Last good /clients/opencode/config body for the active credential, or null.
-// The transforms below read it; a login or logout in the running service
-// (credential.switched) replaces it and reloads them, so no restart is needed.
-let delivered = null
-
 // Fetches /clients/opencode/config with the resolved credential. Mirrors
 // applyConfig()'s failure handling: never throws, null means "nothing to deliver".
 // A credential that no longer resolves (dead refresh token) or a backend that
@@ -567,10 +571,10 @@ function skillDescription(md) {
 }
 
 // Registers provider+models, mcp servers and skills through the typed
-// transforms, once; each run reads `delivered`.
-async function registerV2Transforms(ctx) {
+// transforms, once; each run reads `state.delivered`.
+async function registerV2Transforms(ctx, state) {
   await ctx.provider.transform((editor) => {
-    for (const [pid, p] of Object.entries(delivered?.config?.provider ?? {})) {
+    for (const [pid, p] of Object.entries(state.delivered?.config?.provider ?? {})) {
       // A throwing transform disables the whole plugin, login included: skip the entry instead.
       try {
         const models = Object.entries(p?.models ?? {}).map(([mid, m]) => toModelInfo(pid, mid, m))
@@ -599,7 +603,7 @@ async function registerV2Transforms(ctx) {
   })
 
   await ctx.mcp.transform((editor) => {
-    for (const [name, m] of Object.entries(delivered?.config?.mcp ?? {})) {
+    for (const [name, m] of Object.entries(state.delivered?.config?.mcp ?? {})) {
       if (m?.type !== "remote" || !m.url) continue
       try {
         editor.set(name, { type: "remote", url: m.url, disabled: m.enabled === false })
@@ -609,7 +613,7 @@ async function registerV2Transforms(ctx) {
 
   await ctx.skill.transform((editor) => {
     const dir = paths().skills
-    for (const s of Array.isArray(delivered?.skills) ? delivered.skills : []) {
+    for (const s of Array.isArray(state.delivered?.skills) ? state.delivered.skills : []) {
       const md = s?.files?.["SKILL.md"]
       if (typeof s?.name !== "string" || !SKILL_NAME.test(s.name) || typeof md !== "string") continue
       try {
@@ -622,12 +626,12 @@ async function registerV2Transforms(ctx) {
 // v2's background service outlives `opencode auth login`: the credential lands
 // in this process (credential.switched, core/src/credential.ts), so re-fetch
 // and reload instead of waiting for a restart. Never awaited; runs until unload.
-async function watchLogin(ctx) {
+async function watchLogin(ctx, state) {
   try {
     for await (const e of ctx.event.subscribe()) {
       if (e?.type !== "credential.switched" || e.data?.integrationID !== PROVIDER) continue
       try {
-        delivered = await loadV2Config(ctx)
+        state.delivered = await loadV2Config(ctx)
         await Promise.all([ctx.provider.reload(), ctx.mcp.reload(), ctx.skill.reload()])
       } catch {} // one failed reload must not end the watch: the next login retries
     }
@@ -661,10 +665,14 @@ export default {
       })
     })
 
-    delivered = await loadV2Config(ctx)
+    // Last good /clients/opencode/config body for this location's credential, or
+    // null. Per setup(): the service runs it once per location in one module
+    // instance, so a module-level value let one location's empty load drop the
+    // provider everywhere at the next reload.
+    const state = { delivered: await loadV2Config(ctx) }
     try {
-      await registerV2Transforms(ctx)
+      await registerV2Transforms(ctx, state)
     } catch {} // ponytail: silent; a broken backend must never stop opencode starting
-    watchLogin(ctx)
+    watchLogin(ctx, state)
   },
 }
