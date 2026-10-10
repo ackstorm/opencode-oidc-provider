@@ -170,7 +170,7 @@ async function rotate(d, client_id, again, user) {
     t = await token(d, { grant_type: "refresh_token", refresh_token: again.refresh, client_id })
   } catch (e) {
     console.warn(`[${PROVIDER}] token refresh failed: ${e.message}`)
-    if (e.status < 400 || e.status >= 500) throw e
+    if (!(e.status >= 400 && e.status < 500)) throw e // 5xx, or no status at all: a network error
     t = await rescue(user, again.refresh)
     if (!t) throw new Error(`${PROVIDER} session expired, run \`opencode auth login ${PROVIDER}\``)
   }

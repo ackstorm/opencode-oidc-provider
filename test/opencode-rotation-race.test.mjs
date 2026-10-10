@@ -30,7 +30,7 @@ const journal = (entry) => {
   writeFileSync(JOURNAL, JSON.stringify(entry))
 }
 
-let tokenStatus = 200 // what the token endpoint answers; 4xx/5xx per test
+let tokenStatus = 200 // what the token endpoint answers; 4xx/5xx per test, 0 = network error
 let tokenCalls = 0
 globalThis.fetch = async (input, init) => {
   const url = typeof input === "string" ? input : input.url
@@ -41,6 +41,7 @@ globalThis.fetch = async (input, init) => {
   if (url === "https://as.test/register") return ok({ client_id: "c1" })
   if (url === "https://as.test/token") {
     tokenCalls += 1
+    if (tokenStatus === 0) throw new TypeError("fetch failed")
     if (tokenStatus === 200) return ok({ access_token: jwt("alice"), refresh_token: "r-new", expires_in: 3600 })
     return Response.json({ error: "invalid_grant" }, { status: tokenStatus })
   }
@@ -89,6 +90,16 @@ test("v1: a 5xx is an outage, not a sign-out and not a race", async () => {
   const provider = await SsoAuth({ client: { auth: { set: async () => {} } } }, OPTIONS)
   const loader = await provider.auth.loader(async () => auth)
   await assert.rejects(loader.fetch("https://model.test/x"), /503/)
+  tokenStatus = 200
+})
+
+test("v1: a network error is an outage too, not a sign-out", async () => {
+  tokenStatus = 0
+  journal(winnerJournal())
+  const auth = { type: "oauth", access: ALICE, refresh: "r-flaky", expires: 0 }
+  const provider = await SsoAuth({ client: { auth: { set: async () => {} } } }, OPTIONS)
+  const loader = await provider.auth.loader(async () => auth)
+  await assert.rejects(loader.fetch("https://model.test/x"), /fetch failed/)
   tokenStatus = 200
 })
 
