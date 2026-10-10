@@ -37,6 +37,13 @@ function fakeCtx() {
   }
   const providers = state(() => [])
   providers.editor = (list) => ({ add: (p) => list.push(p) })
+  // watchLogin ends every switch with a provider reload: login() resolves then.
+  const reloaded = []
+  const reload = providers.reload
+  providers.reload = async () => {
+    await reload()
+    reloaded.splice(0).forEach((r) => r())
+  }
   const skills = state(() => [])
   skills.editor = (list) => ({ add: (s) => list.push(s) })
   const noop = () => ({ editor: () => ({ set() {}, add() {} }), transform: async () => {}, reload: async () => {} })
@@ -45,8 +52,13 @@ function fakeCtx() {
     skills,
     login(c) {
       connection = c
+      const done = new Promise((resolve, reject) => {
+        reloaded.push(resolve)
+        setTimeout(() => reject(new Error("login: no provider reload within 2 s")), 2_000).unref()
+      })
       events.push({ type: "credential.switched", data: { integrationID: "acme", credentialID: c ? "cred_1" : null } })
       wake?.()
+      return done
     },
     ctx: {
       options: { api: "https://api.test/v1", platform: "https://api.test", provider: "acme" },
@@ -80,8 +92,7 @@ test("v2: login and logout in the running service reload the provider", async ()
   await f.providers.reload()
   assert.deepEqual(f.providers.value, []) // signed out at start: nothing delivered
 
-  f.login({ type: "credential", id: "cred_1" })
-  await settle()
+  await f.login({ type: "credential", id: "cred_1" })
   assert.deepEqual(f.providers.value.map((p) => p.info.id), ["acme"])
   assert.deepEqual(f.providers.value[0].models.map((m) => m.id), ["acme.smart", "acme.think"])
 
@@ -98,21 +109,18 @@ test("v2: login and logout in the running service reload the provider", async ()
   await f.skills.reload()
   assert.deepEqual(f.skills.value.map((s) => [s.id, s.description]), [["acme-api", "Use when the user mentions Acme."]])
 
-  f.login(undefined)
-  await settle()
+  await f.login(undefined)
   assert.deepEqual(f.providers.value, [])
 })
 
 test("v2: a dead refresh token keeps the cached provider and names the re-login", async () => {
   const f = fakeCtx()
   await plugin.setup(f.ctx)
-  f.login({ type: "credential", id: "cred_1" }) // fills the cache, like the test above
-  await settle()
+  await f.login({ type: "credential", id: "cred_1" }) // fills the cache, like the test above
 
   // what core does when our refresh() throws: AuthorizationError wraps it
   f.ctx.integration.connection.resolve = async () => { throw new Error("Integration.Authorization") }
-  f.login({ type: "credential", id: "cred_1" })
-  await settle()
+  await f.login({ type: "credential", id: "cred_1" })
   assert.deepEqual(f.providers.value.map((p) => p.info.id), ["acme"])
 
   const realFetch = globalThis.fetch
@@ -141,8 +149,7 @@ test("v2: a dead refresh token keeps the cached provider and names the re-login"
 test("v2: each location keeps its own config", async () => {
   const a = fakeCtx()
   await plugin.setup(a.ctx)
-  a.login({ type: "credential", id: "cred_1" })
-  await settle()
+  await a.login({ type: "credential", id: "cred_1" })
   assert.deepEqual(a.providers.value.map((p) => p.info.id), ["acme"])
 
   await plugin.setup(fakeCtx().ctx) // second location, nothing to deliver

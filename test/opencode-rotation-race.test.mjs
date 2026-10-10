@@ -11,6 +11,7 @@ import { tmpdir } from "node:os"
 
 process.env.OIDC_JOURNAL_POLL_MS = "20"
 process.env.OIDC_JOURNAL_GRACE_MS = "400"
+process.env.OIDC_ROTATING_WAIT_MS = "1500"
 process.env.XDG_DATA_HOME = mkdtempSync(`${tmpdir()}/opencode-race-`)
 const { SsoAuth, default: plugin } = await import("../index.mjs")
 const HOME = `${process.env.XDG_DATA_HOME}/opencode/acme`
@@ -32,6 +33,8 @@ const journal = (entry) => {
 
 let tokenStatus = 200 // what the token endpoint answers; 4xx/5xx per test, 0 = network error
 let tokenCalls = 0
+let tokenSeq = [] // per-call statuses, consumed first; then tokenStatus
+let tokenDesc // error_description on a 4xx
 globalThis.fetch = async (input, init) => {
   const url = typeof input === "string" ? input : input.url
   const ok = (body) => Response.json(body)
@@ -41,9 +44,10 @@ globalThis.fetch = async (input, init) => {
   if (url === "https://as.test/register") return ok({ client_id: "c1" })
   if (url === "https://as.test/token") {
     tokenCalls += 1
-    if (tokenStatus === 0) throw new TypeError("fetch failed")
-    if (tokenStatus === 200) return ok({ access_token: jwt("alice"), refresh_token: "r-new", expires_in: 3600 })
-    return Response.json({ error: "invalid_grant" }, { status: tokenStatus })
+    const status = tokenSeq.length ? tokenSeq.shift() : tokenStatus
+    if (status === 0) throw new TypeError("fetch failed")
+    if (status === 200) return ok({ access_token: jwt("alice"), refresh_token: "r-new", expires_in: 3600 })
+    return Response.json({ error: "invalid_grant", error_description: tokenDesc }, { status })
   }
   if (url.startsWith("https://model.test")) return new Response(`authed:${input.headers?.get("authorization")}`)
   throw new Error(`unexpected ${url}`)
@@ -100,6 +104,53 @@ test("v1: a network error is an outage too, not a sign-out", async () => {
   const provider = await SsoAuth({ client: { auth: { set: async () => {} } } }, OPTIONS)
   const loader = await provider.auth.loader(async () => auth)
   await assert.rejects(loader.fetch("https://model.test/x"), /fetch failed/)
+  tokenStatus = 200
+})
+
+// ACH >= 0.13.6 answers a racer at once ("rotation in progress") while the
+// winner may wait on the IdP for up to 30 s: the racer outlasts the short grace.
+test("v1: a racer told 'rotation in progress' waits past the short grace", async () => {
+  journal({}) // no winner yet
+  tokenStatus = 400
+  tokenDesc = "refresh token rotation in progress"
+  let auth = { type: "oauth", access: ALICE, refresh: "r-race", expires: 0 }
+  const provider = await SsoAuth({ client: { auth: { set: async ({ body }) => { auth = body } } } }, OPTIONS)
+  const loader = await provider.auth.loader(async () => auth)
+  const won = { ...winnerJournal(), previous: "r-race", refresh: "r-won" }
+  setTimeout(() => journal(won), 900) // later than OIDC_JOURNAL_GRACE_MS, sooner than OIDC_ROTATING_WAIT_MS
+  const r = await loader.fetch("https://model.test/x")
+  assert.equal(await r.text(), `authed:Bearer ${won.access}`)
+  tokenStatus = 200
+  tokenDesc = undefined
+})
+
+// The winner failed (IdP down) and the AS handed the token back: no winner's
+// tokens ever appear, so the racer exchanges once more instead of signing out.
+test("v1: a racer whose winner never shows up retries the exchange once", async () => {
+  journal({}) // no winner yet
+  tokenDesc = "refresh token rotation in progress"
+  tokenSeq = [400, 200]
+  const before = tokenCalls
+  const auth = { type: "oauth", access: ALICE, refresh: "r-lonely", expires: 0 }
+  const provider = await SsoAuth({ client: { auth: { set: async () => {} } } }, OPTIONS)
+  const loader = await provider.auth.loader(async () => auth)
+  const r = await loader.fetch("https://model.test/x")
+  assert.match(await r.text(), /^authed:Bearer /)
+  assert.equal(tokenCalls - before, 2)
+  tokenSeq = []
+  tokenDesc = undefined
+})
+
+// A bare 4xx is a dead token: no long wait, the user is told to sign in.
+test("v1: a bare 4xx with no winner signs out after the short grace", async () => {
+  journal({}) // no winner yet
+  tokenStatus = 400
+  const auth = { type: "oauth", access: ALICE, refresh: "r-dead", expires: 0 }
+  const provider = await SsoAuth({ client: { auth: { set: async () => {} } } }, OPTIONS)
+  const loader = await provider.auth.loader(async () => auth)
+  const t0 = Date.now()
+  await assert.rejects(loader.fetch("https://model.test/x"), /session expired/)
+  assert.ok(Date.now() - t0 < 1200, "a dead token must not wait for a rotation")
   tokenStatus = 200
 })
 

@@ -43,7 +43,10 @@ const b64 = (b) => Buffer.from(b).toString("base64url")
 
 async function json(url, init) {
   const r = await fetch(url, { signal: AbortSignal.timeout(15_000), ...init })
-  if (!r.ok) throw Object.assign(new Error(`${r.status} ${url}`), { status: r.status })
+  if (!r.ok) {
+    const oauth = await r.json().catch(() => ({})) // RFC 6749 §5.2 error body, when there is one
+    throw Object.assign(new Error(`${r.status} ${url}`), { status: r.status, oauth })
+  }
   return r.json()
 }
 
@@ -138,6 +141,12 @@ async function token({ as }, form) {
 // adopts tokens of the same user (JWT sub) that are still valid for over 60 s.
 const JOURNAL_POLL = Number(process.env.OIDC_JOURNAL_POLL_MS ?? 250)
 const JOURNAL_GRACE = Number(process.env.OIDC_JOURNAL_GRACE_MS ?? 2_500) // the loser's 4xx crosses the winner's write
+// An AS that takes the refresh token before asking its IdP (ACH >= 0.13.6)
+// answers a racer at once, with this error_description, while the winner may
+// still wait on the IdP for up to 30 s: wait that long for its tokens. A bare
+// 4xx (a dead token, or an AS without the hint) keeps the short grace.
+const ROTATING = "refresh token rotation in progress"
+const ROTATING_WAIT = Number(process.env.OIDC_ROTATING_WAIT_MS ?? 35_000)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 async function journalWrite(t, previous) {
@@ -151,11 +160,11 @@ const adoptable = (j, user) => typeof j?.refresh === "string" && user != null &&
 // What replaced `spent`: the winner writes the journal right after its exchange
 // answers, so a loser whose 4xx arrived first polls briefly before giving up.
 // null = nothing replaced it, the session is really over.
-async function rescue(user, spent) {
+async function rescue(user, spent, wait) {
   for (let waited = 0; ; waited += JOURNAL_POLL) {
     const j = await readJson(paths().journal)
     if (adoptable(j, user) && j.refresh !== spent) return { access: j.access, refresh: j.refresh, expires: j.expires }
-    if (waited >= JOURNAL_GRACE) return null
+    if (waited >= wait) return null
     await sleep(JOURNAL_POLL)
   }
 }
@@ -165,14 +174,20 @@ async function rescue(user, spent) {
 // before declaring the session over. A 5xx keeps its error: an outage is not
 // a sign-out.
 async function rotate(d, client_id, again, user) {
+  const form = { grant_type: "refresh_token", refresh_token: again.refresh, client_id }
+  const expired = () => new Error(`${PROVIDER} session expired, run \`opencode auth login ${PROVIDER}\``)
+  const is4xx = (e) => e.status >= 400 && e.status < 500 // 5xx, or no status at all (a network error): an outage
   let t
   try {
-    t = await token(d, { grant_type: "refresh_token", refresh_token: again.refresh, client_id })
+    t = await token(d, form)
   } catch (e) {
     console.warn(`[${PROVIDER}] token refresh failed: ${e.message}`)
-    if (!(e.status >= 400 && e.status < 500)) throw e // 5xx, or no status at all: a network error
-    t = await rescue(user, again.refresh)
-    if (!t) throw new Error(`${PROVIDER} session expired, run \`opencode auth login ${PROVIDER}\``)
+    if (!is4xx(e)) throw e
+    const racing = e.oauth?.error_description === ROTATING
+    t = await rescue(user, again.refresh, racing ? ROTATING_WAIT : JOURNAL_GRACE)
+    // No winner's tokens: a winner that failed (IdP down) handed the token back.
+    if (!t && racing) t = await token(d, form).catch((e2) => { throw is4xx(e2) ? expired() : e2 })
+    if (!t) throw expired()
   }
   await journalWrite(t, again.refresh) // for an adopted token too: harmless, keeps `at` fresh
   return t

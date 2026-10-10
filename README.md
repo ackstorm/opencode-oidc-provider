@@ -91,3 +91,11 @@ Tokens live in OpenCode's own credential store; the plugin never writes it.
 across processes, and the authorization server invalidates a refresh token the
 moment it rotates it, so a process that loses the race needs the winner's tokens
 to keep serving the request.
+
+How long the loser waits for them depends on the backend's answer. A token
+endpoint that replies `invalid_grant` with `error_description: "refresh token
+rotation in progress"` (ACH 0.13.6 and later: another refresh holds the token
+and may still be waiting on the identity provider) gets up to 35 s, then one
+more exchange in case that refresh failed and the token was handed back. Any
+other 4xx is a dead session after 2.5 s: `session expired, run opencode auth
+login <provider>`.
