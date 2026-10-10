@@ -6,6 +6,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync
 import { tmpdir } from "node:os"
 
 process.env.XDG_DATA_HOME = mkdtempSync(`${tmpdir()}/opencode-hook-`)
+process.env.OIDC_JOURNAL_POLL_MS = "10"
+process.env.OIDC_JOURNAL_GRACE_MS = "50"
 const DATA = `${process.env.XDG_DATA_HOME}/opencode`
 const HOME = `${DATA}/acme`
 const CACHE = `${HOME}/config.json`

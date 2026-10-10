@@ -83,6 +83,11 @@ on **v1 only**; the user's own `model` / `small_model` win. v2 ignores them for 
 |---|---|
 | `<provider>/client.json` | The dynamic client registration (client id). |
 | `<provider>/config.json` | Last good backend config (0600), used for 30 days when the backend is down. |
+| `<provider>/rotation.json` | The latest tokens this machine exchanged (0600): when processes race a refresh-token rotation, the loser adopts the winner's tokens from here instead of failing the request. |
 | `<provider>/skills/<name>/SKILL.md` | Skills delivered by the backend. |
 
 Tokens live in OpenCode's own credential store; the plugin never writes it.
+`rotation.json` is the one exception by design: OpenCode shares one credential
+across processes, and the authorization server invalidates a refresh token the
+moment it rotates it, so a process that loses the race needs the winner's tokens
+to keep serving the request.

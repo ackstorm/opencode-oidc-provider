@@ -33,6 +33,7 @@ const paths = () => ({
   legacyClient: `${DATA}/${PROVIDER}-client.json`, // layout before the per-provider folder
   cache: `${DATA}/${PROVIDER}/config.json`,
   skills: `${DATA}/${PROVIDER}/skills`,
+  journal: `${DATA}/${PROVIDER}/rotation.json`, // latest exchange: the cross-process race breaker
 })
 const CONFIG_SCHEMA = "ackstorm.opencode-config/1"
 const CONFIG_KEYS = ["provider", "mcp", "instructions", "model", "small_model"] // anything else the server sends is ignored
@@ -127,8 +128,59 @@ async function token({ as }, form) {
   return { access: j.access_token, refresh: j.refresh_token, expires: Date.now() + j.expires_in * 1000 }
 }
 
+// The newest tokens this machine exchanged, both engines, every exchange: the
+// cross-process race breaker. opencode shares one credential across processes,
+// each with its own view of the store, and the AS invalidates a refresh token
+// the moment it rotates it — so a process that refreshes with a token another
+// process has already spent gets a 4xx and the turn is lost. The loser adopts
+// the winner's tokens from here instead. It duplicates secrets on disk (0600,
+// like every file in this folder, and opencode's own store) and only ever
+// adopts tokens of the same user (JWT sub) that are still valid for over 60 s.
+const JOURNAL_POLL = Number(process.env.OIDC_JOURNAL_POLL_MS ?? 250)
+const JOURNAL_GRACE = Number(process.env.OIDC_JOURNAL_GRACE_MS ?? 2_500) // the loser's 4xx crosses the winner's write
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+async function journalWrite(t, previous) {
+  try {
+    await writePrivate(paths().journal, JSON.stringify({ user: sub(t.access), previous, refresh: t.refresh, access: t.access, expires: t.expires, at: Date.now() }))
+  } catch {} // best effort: without it the rescue degrades to "session expired"
+}
+
+const adoptable = (j, user) => typeof j?.refresh === "string" && user != null && j.user === user && j.expires > Date.now() + 60_000
+
+// What replaced `spent`: the winner writes the journal right after its exchange
+// answers, so a loser whose 4xx arrived first polls briefly before giving up.
+// null = nothing replaced it, the session is really over.
+async function rescue(user, spent) {
+  for (let waited = 0; ; waited += JOURNAL_POLL) {
+    const j = await readJson(paths().journal)
+    if (adoptable(j, user) && j.refresh !== spent) return { access: j.access, refresh: j.refresh, expires: j.expires }
+    if (waited >= JOURNAL_GRACE) return null
+    await sleep(JOURNAL_POLL)
+  }
+}
+
+// One refresh-token exchange, shared by both engines. A 4xx may only mean that
+// another process spent this refresh token first: adopt the winner's tokens
+// before declaring the session over. A 5xx keeps its error: an outage is not
+// a sign-out.
+async function rotate(d, client_id, again, user) {
+  let t
+  try {
+    t = await token(d, { grant_type: "refresh_token", refresh_token: again.refresh, client_id })
+  } catch (e) {
+    console.warn(`[${PROVIDER}] token refresh failed: ${e.message}`)
+    if (e.status < 400 || e.status >= 500) throw e
+    t = await rescue(user, again.refresh)
+    if (!t) throw new Error(`${PROVIDER} session expired, run \`opencode auth login ${PROVIDER}\``)
+  }
+  await journalWrite(t, again.refresh) // for an adopted token too: harmless, keeps `at` fresh
+  return t
+}
+
 // One in-flight refresh per process, shared by loader.fetch and the config hook.
-// ponytail: a lost race across processes spends a rotated refresh token.
+// A race across processes no longer spends a rotated token: the journal lets the
+// loser adopt the winner's instead.
 let refreshing
 // Tokens from a refresh whose client.auth.set failed; preferred until saved.
 let unsaved
@@ -143,15 +195,17 @@ async function fresh(cur, { client, options, getAuth }) {
     const d = await discover(client, options)
     const client_id = await savedClientId(d.issuer)
     if (!client_id) throw new Error(`SSO client identity lost, run \`opencode auth login -p ${PROVIDER}\``)
+    // The store can lag a rotation by another process, which invalidated the
+    // spent refresh token: the journal holds its successor — adopt it instead
+    // of spending the token again.
+    const j = await readJson(paths().journal)
     const t = {
       type: "oauth",
-      // Only the token endpoint's 4xx means "signed out"; a 4xx from discovery
-      // (a misrouted .well-known) is an outage, not a revoked session.
-      ...(await token(d, { grant_type: "refresh_token", refresh_token: again.refresh, client_id }).catch((e) => {
-        console.warn(`[${PROVIDER}] token refresh failed: ${e.message}`)
-        if (e.status >= 400 && e.status < 500) throw new Error(`${PROVIDER} session expired, run \`opencode auth login ${PROVIDER}\``)
-        throw e
-      })),
+      ...(adoptable(j, sub(again?.access)) && j.previous === again.refresh
+        ? { access: j.access, refresh: j.refresh, expires: j.expires }
+        // Only the token endpoint's 4xx means "signed out"; a 4xx from discovery
+        // (a misrouted .well-known) is an outage, not a revoked session.
+        : await rotate(d, client_id, again, sub(again?.access))),
     }
     t.refresh ||= again.refresh
     try {
@@ -275,7 +329,6 @@ async function applyConfig(cfg, { client, options }) {
 async function pollDevice(d, form, interval, expiresIn) {
   const deadline = Date.now() + expiresIn * 1000
   let wait = (interval || 5) * 1000
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
   for (;;) {
     await sleep(wait)
     const r = await fetch(d.as.token_endpoint, {
@@ -362,6 +415,7 @@ export async function SsoAuth({ client }, options = {}) {
               async callback() {
                 try {
                   const t = await token(d, { grant_type: "authorization_code", code: await code, redirect_uri, client_id, code_verifier: verifier })
+                  await journalWrite(t, null) // a login replaces tokens; nothing was rotated
                   return { type: "success", ...t }
                 } catch {
                   return { type: "failed" }
@@ -389,6 +443,7 @@ export async function SsoAuth({ client }, options = {}) {
               async callback() {
                 try {
                   const t = await pollDevice(d, { grant_type: "urn:ietf:params:oauth:grant-type:device_code", device_code: da.device_code, client_id }, da.interval, da.expires_in)
+                  await journalWrite(t, null) // a login replaces tokens; nothing was rotated
                   return { type: "success", ...t }
                 } catch {
                   return { type: "failed" }
@@ -469,7 +524,16 @@ function toModelInfo(providerID, id, m) {
 const refreshes = new Map()
 function refreshCredential(methodID, credential, options) {
   const key = credential.refresh
-  if (!refreshes.has(key)) refreshes.set(key, exchange(methodID, credential, options).finally(() => refreshes.delete(key)))
+  if (!refreshes.has(key)) refreshes.set(key, (async () => {
+    // The credential this process was handed may lag a rotation by another
+    // process, which invalidated the spent refresh token: the journal holds
+    // its successor — adopt it instead of spending the token again.
+    const j = await readJson(paths().journal)
+    if (adoptable(j, sub(credential.access)) && j.previous === credential.refresh) {
+      return { type: "oauth", methodID, refresh: j.refresh, access: j.access, expires: j.expires }
+    }
+    return exchange(methodID, credential, options)
+  })().finally(() => refreshes.delete(key)))
   return refreshes.get(key)
 }
 
@@ -477,12 +541,7 @@ async function exchange(methodID, credential, options) {
   const d = await discover(undefined, options)
   const client_id = await savedClientId(d.issuer)
   if (!client_id) throw new Error(`SSO client identity lost, run \`opencode auth login -p ${PROVIDER}\``)
-  const t = await token(d, { grant_type: "refresh_token", refresh_token: credential.refresh, client_id }).catch((e) => {
-    console.warn(`[${PROVIDER}] token refresh failed: ${e.message}`)
-    // Only the token endpoint's 4xx (invalid_grant) means the session is over; 5xx is retried.
-    if (e.status >= 400 && e.status < 500) throw new Error(`${PROVIDER} session expired, run \`opencode auth login ${PROVIDER}\``)
-    throw e
-  })
+  const t = await rotate(d, client_id, credential, sub(credential.access))
   return { type: "oauth", methodID, refresh: t.refresh || credential.refresh, access: t.access, expires: t.expires }
 }
 
@@ -509,6 +568,7 @@ async function authorizeBrowser(options) {
     mode: "auto",
     callback: (async () => {
       const t = await token(d, { grant_type: "authorization_code", code: await code, redirect_uri, client_id, code_verifier: verifier })
+      await journalWrite(t, null) // a login replaces tokens; nothing was rotated
       return { type: "oauth", methodID: "sso-browser", refresh: t.refresh, access: t.access, expires: t.expires }
     })(),
   }
@@ -527,9 +587,10 @@ async function authorizeDevice(options) {
     url: da.verification_uri_complete ?? da.verification_uri,
     instructions: `Open the URL in any browser (this or another machine), confirm the code ${da.user_code} and sign in. This session completes on its own.`,
     mode: "auto",
-    callback: pollDevice(d, { grant_type: "urn:ietf:params:oauth:grant-type:device_code", device_code: da.device_code, client_id }, da.interval, da.expires_in).then(
-      (t) => ({ type: "oauth", methodID: "sso-device", refresh: t.refresh, access: t.access, expires: t.expires }),
-    ),
+    callback: pollDevice(d, { grant_type: "urn:ietf:params:oauth:grant-type:device_code", device_code: da.device_code, client_id }, da.interval, da.expires_in).then(async (t) => {
+      await journalWrite(t, null) // a login replaces tokens; nothing was rotated
+      return { type: "oauth", methodID: "sso-device", refresh: t.refresh, access: t.access, expires: t.expires }
+    }),
   }
 }
 

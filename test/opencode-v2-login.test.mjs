@@ -7,6 +7,8 @@ import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 
 process.env.XDG_DATA_HOME = mkdtempSync(`${tmpdir()}/opencode-v2-`)
+process.env.OIDC_JOURNAL_POLL_MS = "10"
+process.env.OIDC_JOURNAL_GRACE_MS = "50"
 const plugin = (await import("../index.mjs")).default
 
 globalThis.fetch = async (input) => {
