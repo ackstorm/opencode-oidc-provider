@@ -81,7 +81,7 @@ on **v1 only**; the user's own `model` / `small_model` win. v2 ignores them for 
 
 | File | Content |
 |---|---|
-| `<provider>/client.json` | The dynamic client registration (client id). |
+| `<provider>/client.json` | The dynamic client registration (client id), renewed at sign-in once it is 60 days old. |
 | `<provider>/config.json` | Last good backend config (0600), used for 30 days when the backend is down. |
 | `<provider>/rotation.json` | The latest tokens this machine exchanged (0600): when processes race a refresh-token rotation, the loser adopts the winner's tokens from here instead of failing the request. |
 | `<provider>/skills/<name>/SKILL.md` | Skills delivered by the backend. |

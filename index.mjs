@@ -90,19 +90,25 @@ function discover(client, options, fresh = false) {
 }
 
 // The saved DCR identity, or null. A refresh token belongs to the client that
-// obtained it, so a refresh must never register a new one (login does).
-async function savedClientId(issuer) {
+// obtained it, so a refresh must never register a new one (login does) and
+// takes the saved one whatever its age.
+async function savedClientId(issuer, maxAge = Infinity) {
   for (const file of [paths().client, paths().legacyClient]) {
     try {
       const saved = JSON.parse(await readFile(file, "utf8"))
-      if (saved.issuer === issuer) return saved.client_id
+      if (saved.issuer === issuer && !(Date.now() - (saved.at ?? 0) > maxAge)) return saved.client_id
     } catch {}
   }
   return null
 }
 
+// The AS drops a registration after 90 days and then refuses the login
+// ("unknown client_id"), so a login registers again well before that. A
+// registration saved without its time counts as aged.
+const CLIENT_MAX_AGE = 60 * 86_400_000
+
 async function clientId({ issuer, as }) {
-  const saved = await savedClientId(issuer)
+  const saved = await savedClientId(issuer, CLIENT_MAX_AGE)
   if (saved) return saved
   const { client_id } = await json(as.registration_endpoint, {
     method: "POST",
@@ -118,7 +124,7 @@ async function clientId({ issuer, as }) {
     }),
   })
   await mkdir(`${DATA}/${PROVIDER}`, { recursive: true, mode: 0o700 })
-  await writeFile(paths().client, JSON.stringify({ issuer, client_id }), { mode: 0o600 })
+  await writeFile(paths().client, JSON.stringify({ issuer, client_id, at: Date.now() }), { mode: 0o600 })
   return client_id
 }
 

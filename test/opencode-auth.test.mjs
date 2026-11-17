@@ -4,7 +4,7 @@
 // poison the process, and a stray loopback hit must not consume the listener.
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync } from "node:fs"
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 
 process.env.XDG_DATA_HOME = mkdtempSync(`${tmpdir()}/opencode-auth-`)
@@ -158,6 +158,67 @@ test("the device method opens the verification URL and polls until the user has 
   assert.equal(devicePolls, 2, "one authorization_pending, then the token")
   // Loopback stays the default method (OpenWork and the CLI take methods[0]).
   assert.equal(plugin.auth.methods[0].label, "SSO (browser)")
+})
+
+// The AS drops a registration after 90 days and then answers a login with
+// "unknown client_id". A refresh never reads the registration, and its token
+// belongs to the client that obtained it.
+test("a login registers again once the saved registration has aged; a refresh keeps the saved one", async () => {
+  // Its own module and provider: the test rewrites client.json, which other tests share.
+  const { SsoAuth: Fresh } = await import("../index.mjs?aged")
+  const f = fakeClient()
+  const plugin = await Fresh({ client: f.client }, { ...OPTIONS, provider: "acme-aged" })
+  const dir = `${process.env.XDG_DATA_HOME}/opencode/acme-aged`
+  const saved = () => JSON.parse(readFileSync(`${dir}/client.json`, "utf8"))
+  const save = (client) => {
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(`${dir}/client.json`, JSON.stringify({ issuer: ISSUER, ...client }))
+  }
+  const DAY = 86_400_000
+  const known = new Set(["c-recent"]) // the registrations the AS still holds
+  let registers = 0
+  let refreshedAs
+  const base = globalThis.fetch
+  globalThis.fetch = async (input, init) => {
+    const url = typeof input === "string" ? input : input.url
+    const id = () => new URLSearchParams(init.body).get("client_id")
+    if (url === `${ISSUER}/register`) {
+      known.add(`c-new${++registers}`)
+      return Response.json({ client_id: `c-new${registers}` })
+    }
+    if (url === `${ISSUER}/device_authorization` && !known.has(id())) return Response.json({ error: "invalid_client" }, { status: 400 })
+    if (url === `${ISSUER}/token`) {
+      refreshedAs = id()
+      return Response.json({ access_token: "a-aged", refresh_token: "r-current", expires_in: 3600 })
+    }
+    return base(input, init)
+  }
+  try {
+    const device = plugin.auth.methods[1]
+
+    // A file without a timestamp: its age is unknown.
+    save({ client_id: "c-old" })
+    const loader = await plugin.auth.loader(f.getAuth)
+    assert.equal(await (await loader.fetch("https://model.test/x")).text(), "authed:Bearer a-aged")
+    assert.equal(refreshedAs, "c-old", "the refresh used the saved identity")
+    assert.equal(registers, 0, "a refresh never registers")
+
+    await device.authorize()
+    assert.equal(registers, 1)
+    assert.equal(saved().client_id, "c-new1")
+    assert.equal(typeof saved().at, "number")
+
+    save({ client_id: "c-expired", at: Date.now() - 61 * DAY })
+    await device.authorize()
+    assert.equal(saved().client_id, "c-new2")
+
+    save({ client_id: "c-recent", at: Date.now() - 59 * DAY })
+    await device.authorize()
+    assert.equal(registers, 2, "a registration the AS still holds is reused")
+    assert.equal(saved().client_id, "c-recent")
+  } finally {
+    globalThis.fetch = base
+  }
 })
 
 test("the legacy install (no platform.json, no options) still discovers from the configured provider", async () => {
