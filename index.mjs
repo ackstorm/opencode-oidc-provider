@@ -128,11 +128,16 @@ async function clientId({ issuer, as }) {
   return client_id
 }
 
+// A refresh waits on the AS's own call to its identity provider, which the AS
+// allows 30 s: giving up sooner fails a refresh the AS would have answered.
+const REFRESH_TIMEOUT = 40_000
+
 async function token({ as }, form) {
   const j = await json(as.token_endpoint, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams(form),
+    ...(form.grant_type === "refresh_token" && { signal: AbortSignal.timeout(REFRESH_TIMEOUT) }),
   })
   return { access: j.access_token, refresh: j.refresh_token, expires: Date.now() + j.expires_in * 1000 }
 }
